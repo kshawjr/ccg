@@ -1,13 +1,14 @@
 import type { Scores } from './types';
 
 // Rename these in one place if the CRM admin uses different field API names.
-// Same five fields live on both Contacts_Hub and Deals.
+// Same six fields live on both Contacts_Hub and Deals.
 export const ZOHO_FIELDS = {
   orange: 'Orange',
   blue: 'Blue',
   gold: 'Gold',
   green: 'Green',
   received: 'True_Colors_Rcvd',
+  analysisUrl: 'True_Colors_Analysis_URL',
 } as const;
 
 export const CONTACTS_HUB_MODULE = 'Contacts_Hub';
@@ -186,6 +187,52 @@ export async function writeResults(
     if (row && row.status && row.status !== 'success') {
       throw new Error(
         `Zoho ${module} per-record error: ${row.code || ''} ${row.message || ''}`.trim(),
+      );
+    }
+  } catch (err) {
+    if (err instanceof Error && err.message.startsWith('Zoho ')) throw err;
+  }
+}
+
+/**
+ * Write only the analysis URL field. Used after the PDF pipeline completes,
+ * separately from the score write so the two failure modes don't tangle.
+ */
+export async function writeAnalysisUrl(
+  module: string,
+  recordId: string,
+  url: string,
+): Promise<void> {
+  const token = await getAccessToken();
+  const payload = {
+    data: [
+      {
+        id: recordId,
+        [ZOHO_FIELDS.analysisUrl]: url,
+      },
+    ],
+  };
+  const res = await fetch(`${apiBase()}/crm/v6/${encodeURIComponent(module)}`, {
+    method: 'PUT',
+    headers: {
+      Authorization: `Zoho-oauthtoken ${token}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(payload),
+    cache: 'no-store',
+  });
+  const text = await res.text();
+  if (!res.ok) {
+    throw new Error(`Zoho analysis URL write to ${module} failed (${res.status}): ${text}`);
+  }
+  try {
+    const body = JSON.parse(text) as {
+      data?: Array<{ code?: string; message?: string; status?: string }>;
+    };
+    const row = body.data?.[0];
+    if (row && row.status && row.status !== 'success') {
+      throw new Error(
+        `Zoho ${module} analysis URL per-record error: ${row.code || ''} ${row.message || ''}`.trim(),
       );
     }
   } catch (err) {

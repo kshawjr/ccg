@@ -62,3 +62,38 @@ alter table assessment_progress
 
 alter table assessment_progress
   drop column if exists primary_color;
+
+-- Analysis pipeline columns (added 2026-05-27).
+alter table assessment_progress
+  add column if not exists analysis_json jsonb;
+alter table assessment_progress
+  add column if not exists analysis_url text;
+alter table assessment_progress
+  add column if not exists analysis_error text;
+
+-- URL shortener (added 2026-05-27).
+-- Backs the /r/[code] redirect route so we don't push 800-char signed URLs
+-- into Zoho's URL field.
+create table if not exists short_links (
+  code        text primary key,
+  long_url    text not null,
+  created_at  timestamptz not null default now()
+);
+
+alter table short_links enable row level security;
+
+-- Refresh / double-submit protection (added 2026-05-27).
+-- 'pending' on insert, atomically flipped to 'scoring' as the submit route
+-- claims the row, then to 'complete' once Zoho score writes land.
+alter table assessment_progress
+  add column if not exists submission_status text not null default 'pending';
+
+update assessment_progress
+  set submission_status = 'complete'
+  where is_complete = true and submission_status <> 'complete';
+
+alter table assessment_progress
+  drop constraint if exists assessment_progress_submission_status_check;
+alter table assessment_progress
+  add constraint assessment_progress_submission_status_check
+  check (submission_status in ('pending', 'scoring', 'complete'));

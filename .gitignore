@@ -13,3 +13,6 @@ next-env.d.ts.bak
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
+
+# Locally-rendered test PDFs (the .ts renderer in scratch/ is committed).
+scratch/*.pdf
