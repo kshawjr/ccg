@@ -45,31 +45,52 @@ route handlers using the service role key.
 
 ## 2. Zoho CRM setup
 
-### 2a. Create the custom fields on the **Deals** module
+### 2a. Create the custom fields on **both Contacts_Hub and Deals**
 
-Settings → Customization → Modules → Deals → Layouts → add these fields:
+Settings → Customization → Modules → (Contacts_Hub *and* Deals) → Layouts → add
+these five fields **on each module** with the exact API names below:
 
-| Field label             | Type          | API name (must match exactly) |
-| ----------------------- | ------------- | ----------------------------- |
-| True Colors Orange      | Number        | `True_Colors_Orange`          |
-| True Colors Blue        | Number        | `True_Colors_Blue`            |
-| True Colors Gold        | Number        | `True_Colors_Gold`            |
-| True Colors Green       | Number        | `True_Colors_Green`           |
-| True Colors Primary     | Picklist      | `True_Colors_Primary` — values: `Orange`, `Blue`, `Gold`, `Green` |
-| True Colors Completed At | Date/Time    | `True_Colors_Completed_At`    |
+| Field label        | Type   | API name (must match exactly) |
+| ------------------ | ------ | ----------------------------- |
+| Orange             | Number | `Orange`                      |
+| Blue               | Number | `Blue`                        |
+| Gold               | Number | `Gold`                        |
+| Green              | Number | `Green`                       |
+| True Colors Rcvd   | Date   | `True_Colors_Rcvd`            |
 
-> If your CRM admin already uses different API names, change them once in
-> `lib/zoho.ts` (`ZOHO_FIELDS` constant) instead of renaming in Zoho.
+Contacts_Hub additionally needs (these already exist in your CRM and are read
+by the app, not created):
 
-### 2b. Get a refresh token (Zoho self-client flow)
+- `Relationship` — picklist that includes the value `Opportunity Owner`
+- `Deal` — lookup to the Deals module
+
+> If your CRM admin uses different API names for the five score fields, change
+> them once in `lib/zoho.ts` (`ZOHO_FIELDS` constant) instead of renaming in Zoho.
+
+### 2b. How the dual write works
+
+When a candidate submits, the server:
+
+1. Re-fetches the `Contacts_Hub` record so it sees the current `Relationship`
+   and `Deal` values (not whatever they were when the token was minted).
+2. Writes the five score fields to that `Contacts_Hub` record.
+3. **If `Relationship == "Opportunity Owner"` AND the `Deal` lookup is
+   populated**, mirrors the same five fields onto the linked Deal.
+
+If either write fails, the assessment is **not** marked complete, the error is
+captured in `zoho_sync_error`, and the API returns 502 so the client can retry.
+Re-trying re-writes Contacts_Hub harmlessly (idempotent) and only attempts the
+Deal write if the condition still holds.
+
+### 2c. Get a refresh token (Zoho self-client flow)
 
 1. Go to <https://api-console.zoho.com> (US data center) → **Add Client** → **Self Client**.
 2. Note the `Client ID` and `Client Secret`. Drop them in `.env.local`:
    - `ZOHO_CLIENT_ID`
    - `ZOHO_CLIENT_SECRET`
 3. In the Self Client tab → **Generate Code**.
-4. Scope: `ZohoCRM.modules.deals.ALL,ZohoCRM.modules.ALL,ZohoCRM.settings.ALL`
-   (at minimum: read + update on Deals).
+4. Scope: `ZohoCRM.modules.ALL,ZohoCRM.settings.ALL`
+   (needs read + update on both Contacts_Hub and Deals).
 5. Time duration: 10 minutes. Scope description: anything.
 6. Copy the generated `code` (it expires fast). Then exchange it for a refresh token:
 
@@ -99,9 +120,10 @@ Pick a long random `ADMIN_API_KEY` (e.g. `openssl rand -hex 32`) and put it in
 curl -X POST http://localhost:3000/api/admin/generate \
   -H "Content-Type: application/json" \
   -H "x-admin-key: $ADMIN_API_KEY" \
-  -d '{"module":"Deals","recordId":"4567890000001234567"}'
+  -d '{"recordId":"4567890000001234567"}'
 ```
 
+The `recordId` is a `Contacts_Hub` record id (the module is hardcoded server-side).
 Response:
 
 ```json
@@ -114,7 +136,8 @@ Response:
 ```
 
 Send that URL to the candidate. They land on a prefilled welcome modal, work through
-six short rounds, and the results are pushed to the Deal in Zoho automatically.
+six short rounds, and the results are pushed to `Contacts_Hub` (and, when
+`Relationship == "Opportunity Owner"`, mirrored to the linked Deal) automatically.
 
 ---
 
@@ -158,12 +181,14 @@ an env var per deployment.
 ## 6. Flow summary
 
 ```
-admin POST /api/admin/generate          → creates assessment_progress row + token
-candidate GET /[token]                   → server reads row, renders Assessment
-candidate ranks cards                    → debounced POST /api/save/[token]
-candidate finishes row 6                 → POST /api/submit/[token]
+admin POST /api/admin/generate         → creates assessment_progress row + token (Contacts_Hub)
+candidate GET /[token]                  → server reads row, renders Assessment
+candidate ranks cards                   → debounced POST /api/save/[token]
+candidate finishes row 6                → POST /api/submit/[token]
   → calculate scores + primary
-  → PUT to Zoho Deals (custom fields)
+  → re-fetch Contacts_Hub (current Relationship + Deal)
+  → PUT scores to Contacts_Hub
+  → if Relationship = "Opportunity Owner" and Deal set, PUT same scores to that Deal
   → mark assessment_progress complete
   → respond { ok, scores, primary }
 ```

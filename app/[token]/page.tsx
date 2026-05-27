@@ -37,7 +37,7 @@ export default async function TokenPage({ params }: { params: { token: string } 
         firstName={row.first_name || 'there'}
         initialResponses={initialResponses}
         alreadyComplete={row.is_complete}
-        savedPrimary={row.primary_color}
+        savedPrimary={null}
         savedScores={row.scores}
       />
     </>
