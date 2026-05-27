@@ -100,11 +100,42 @@ export async function fetchContactsHub(recordId: string): Promise<ContactsHubRec
     throw new Error(`${CONTACTS_HUB_MODULE}/${recordId}: empty response`);
   }
 
-  const firstName = pickString(record, ['First_Name']);
-  const lastName = pickString(record, ['Last_Name']);
   const email = pickString(record, ['Email', 'Secondary_Email']);
   const relationship = pickString(record, ['Relationship']);
   const dealId = pickLookupId(record, 'Deal');
+
+  // Names live on the linked Contact record, not on Contacts_Hub itself.
+  let firstName: string | null = null;
+  let lastName: string | null = null;
+  const contactId = pickLookupId(record, 'Contact');
+  if (contactId) {
+    try {
+      const contactToken = await getAccessToken();
+      const contactRes = await fetch(
+        `${apiBase()}/crm/v6/Contacts/${encodeURIComponent(contactId)}`,
+        {
+          headers: { Authorization: `Zoho-oauthtoken ${contactToken}` },
+          cache: 'no-store',
+        },
+      );
+      if (contactRes.ok) {
+        const contactBody = JSON.parse(await contactRes.text()) as { data?: ZohoRecord[] };
+        const contactRecord = contactBody.data?.[0];
+        if (contactRecord) {
+          firstName = pickString(contactRecord, ['First_Name']);
+          lastName = pickString(contactRecord, ['Last_Name']);
+        } else {
+          console.warn(`[zoho] Contacts/${contactId} returned empty data`);
+        }
+      } else {
+        console.warn(
+          `[zoho] Contacts/${contactId} fetch failed (${contactRes.status})`,
+        );
+      }
+    } catch (err) {
+      console.warn(`[zoho] Contacts/${contactId} fetch error`, err);
+    }
+  }
 
   return { id: recordId, firstName, lastName, email, relationship, dealId };
 }
