@@ -60,7 +60,12 @@ export default function Assessment(props: Props) {
       const raw = window.localStorage.getItem(LS_KEY(token));
       if (raw) {
         const parsed = JSON.parse(raw);
-        if (Array.isArray(parsed) && parsed.length === 6) return parsed as Responses;
+        if (Array.isArray(parsed) && parsed.length === 6) {
+          // Defensive deep clone so no two rows share an inner array reference.
+          return parsed.map((r: unknown) =>
+            Array.isArray(r) && r.length === 4 ? [...r] : [null, null, null, null],
+          ) as Responses;
+        }
       }
     } catch {
       /* ignore */
@@ -235,18 +240,28 @@ export default function Assessment(props: Props) {
   const confettiOriginRef = useRef<HTMLDivElement | null>(null);
   const [burstSeed, setBurstSeed] = useState(0);
 
+  // Always-fresh re-entry guard. Refs (unlike state) update synchronously, so
+  // a second caller within the same tick sees `true` and bails. This is the
+  // belt to the suspenders of keeping advance-scheduling out of state updaters.
+  const advancingRef = useRef(false);
+
   const advanceRow = useCallback(() => {
+    if (advancingRef.current) {
+      if (process.env.NODE_ENV !== 'production') {
+        console.warn('[true-colors] advanceRow re-entered while advance in flight — ignoring');
+      }
+      return;
+    }
+    advancingRef.current = true;
     setRowLeaving(true);
     setIsAdvancing(true);
     setBurstSeed((n) => n + 1); // confetti
     const leaveMs = reducedMotion ? 60 : ROW_LEAVE_MS;
     setTimeout(() => {
+      advancingRef.current = false;
       setRowLeaving(false);
       setIsAdvancing(false);
-      setCurrentRound((r) => {
-        const next = Math.min(r + 1, 5);
-        return next;
-      });
+      setCurrentRound((r) => Math.min(r + 1, 5));
       setEnterKey((k) => k + 1);
     }, leaveMs);
   }, [reducedMotion]);
@@ -281,41 +296,52 @@ export default function Assessment(props: Props) {
       if (isAdvancing) return;
       if (rowIdx !== currentRound) return;
 
-      setResponses((prev) => {
-        const next = prev.map((r) => [...r]) as Responses;
-        const row = next[rowIdx];
-        const current = row[clusterIdx];
+      // Compute the new state from the current snapshot, then call setResponses
+      // with a plain value. The previous version scheduled setTimeout(advanceRow)
+      // *inside* a setResponses((prev) => ...) updater — React 18 may invoke
+      // updater functions more than once, which double-fired the advance and
+      // skipped every other row.
+      const currentRow = responses[rowIdx];
+      const newRow: Array<number | null> = [...currentRow];
+      const cellVal = newRow[clusterIdx];
 
-        if (current !== null) {
-          // Undo this rank and all lower ranks.
-          for (let i = 0; i < row.length; i++) {
-            const v = row[i];
-            if (v !== null && v <= current) row[i] = null;
-          }
-        } else {
-          const nr = nextRank(row);
-          if (nr === null) return prev;
-          row[clusterIdx] = nr;
+      if (cellVal !== null) {
+        // Undo this rank and all lower ranks.
+        for (let i = 0; i < newRow.length; i++) {
+          const v = newRow[i];
+          if (v !== null && v <= cellVal) newRow[i] = null;
         }
+      } else {
+        const nr = nextRank(newRow);
+        if (nr === null) return;
+        newRow[clusterIdx] = nr;
+      }
 
-        // Check completion for this row -> advance or submit.
-        const rowComplete = row.every((v) => v !== null);
-        if (rowComplete) {
-          // Final row? Trigger results after celebration delay.
-          if (rowIdx === 5 && isComplete(next)) {
-            setTimeout(() => {
-              setPhase('results');
-              void triggerSubmit(next);
-            }, RESULTS_DELAY_MS);
-          } else if (rowIdx < 5) {
-            // Animate the leaving row, then advance.
-            setTimeout(() => advanceRow(), 220);
-          }
+      const newResponses: Responses = responses.map((r, i) =>
+        i === rowIdx ? newRow : [...r],
+      );
+      setResponses(newResponses);
+
+      const rowComplete = newRow.every((v) => v !== null);
+      if (!rowComplete) return;
+
+      if (rowIdx === 5) {
+        if (isComplete(newResponses)) {
+          setTimeout(() => {
+            setPhase('results');
+            void triggerSubmit(newResponses);
+          }, RESULTS_DELAY_MS);
+        } else if (process.env.NODE_ENV !== 'production') {
+          console.warn(
+            '[true-colors] final row complete but responses still incomplete',
+            newResponses,
+          );
         }
-        return next;
-      });
+      } else {
+        setTimeout(() => advanceRow(), 220);
+      }
     },
-    [currentRound, isAdvancing, advanceRow, triggerSubmit],
+    [currentRound, isAdvancing, responses, advanceRow, triggerSubmit],
   );
 
   const onResetRow = useCallback(() => {
