@@ -151,14 +151,16 @@ export async function writeResults(
 ): Promise<void> {
   const token = await getAccessToken();
   const today = todayYmd();
+  // The Orange/Blue/Gold/Green fields on Contacts_Hub and Deals are Text,
+  // not Number — sending them as numbers gets INVALID_DATA back from Zoho.
   const payload = {
     data: [
       {
         id: recordId,
-        [ZOHO_FIELDS.orange]: scores.orange,
-        [ZOHO_FIELDS.blue]: scores.blue,
-        [ZOHO_FIELDS.gold]: scores.gold,
-        [ZOHO_FIELDS.green]: scores.green,
+        [ZOHO_FIELDS.orange]: String(scores.orange),
+        [ZOHO_FIELDS.blue]: String(scores.blue),
+        [ZOHO_FIELDS.gold]: String(scores.gold),
+        [ZOHO_FIELDS.green]: String(scores.green),
         [ZOHO_FIELDS.received]: today,
       },
     ],
