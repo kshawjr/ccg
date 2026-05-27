@@ -1,16 +1,18 @@
-import type { Color, Scores } from './types';
+import type { Scores } from './types';
 
 // Rename these in one place if the CRM admin uses different field API names.
+// Same five fields live on both Contacts_Hub and Deals.
 export const ZOHO_FIELDS = {
-  orange: 'True_Colors_Orange',
-  blue: 'True_Colors_Blue',
-  gold: 'True_Colors_Gold',
-  green: 'True_Colors_Green',
-  primary: 'True_Colors_Primary',
-  completedAt: 'True_Colors_Completed_At',
+  orange: 'Orange',
+  blue: 'Blue',
+  gold: 'Gold',
+  green: 'Green',
+  received: 'True_Colors_Rcvd',
 } as const;
 
-export type ZohoModule = 'Leads' | 'Contacts' | 'Deals';
+export const CONTACTS_HUB_MODULE = 'Contacts_Hub';
+export const DEAL_MODULE = 'Deals';
+export const OPPORTUNITY_OWNER = 'Opportunity Owner';
 
 function accountsBase(): string {
   return process.env.ZOHO_ACCOUNTS_BASE || 'https://accounts.zoho.com';
@@ -66,22 +68,27 @@ async function getAccessToken(): Promise<string> {
 
 type ZohoRecord = Record<string, unknown>;
 
-export type ZohoCandidate = {
+export type ContactsHubRecord = {
   id: string;
   firstName: string | null;
   lastName: string | null;
   email: string | null;
+  relationship: string | null;
+  dealId: string | null;
 };
 
-/** Fetch a single record from a module and pluck the name fields. */
-export async function fetchCandidate(module: ZohoModule, recordId: string): Promise<ZohoCandidate> {
+/** Fetch a Contacts_Hub record and pluck the candidate identity + routing fields. */
+export async function fetchContactsHub(recordId: string): Promise<ContactsHubRecord> {
   const token = await getAccessToken();
-  const res = await fetch(`${apiBase()}/crm/v6/${module}/${encodeURIComponent(recordId)}`, {
-    headers: { Authorization: `Zoho-oauthtoken ${token}` },
-    cache: 'no-store',
-  });
+  const res = await fetch(
+    `${apiBase()}/crm/v6/${CONTACTS_HUB_MODULE}/${encodeURIComponent(recordId)}`,
+    {
+      headers: { Authorization: `Zoho-oauthtoken ${token}` },
+      cache: 'no-store',
+    },
+  );
   if (res.status === 204) {
-    throw new Error(`Zoho ${module}/${recordId}: not found`);
+    throw new Error(`${CONTACTS_HUB_MODULE}/${recordId}: not found`);
   }
   const text = await res.text();
   if (!res.ok) {
@@ -90,62 +97,29 @@ export async function fetchCandidate(module: ZohoModule, recordId: string): Prom
   const body = JSON.parse(text) as { data?: ZohoRecord[] };
   const record = body.data?.[0];
   if (!record) {
-    throw new Error(`Zoho ${module}/${recordId}: empty response`);
+    throw new Error(`${CONTACTS_HUB_MODULE}/${recordId}: empty response`);
   }
-  // Deals don't have First_Name/Last_Name natively; fall back to Deal_Name or Contact_Name.
-  const first = pickString(record, ['First_Name']);
-  const last = pickString(record, ['Last_Name']);
+
+  const firstName = pickString(record, ['First_Name']);
+  const lastName = pickString(record, ['Last_Name']);
   const email = pickString(record, ['Email', 'Secondary_Email']);
+  const relationship = pickString(record, ['Relationship']);
+  const dealId = pickLookupId(record, 'Deal');
 
-  let firstName = first;
-  let lastName = last;
-
-  if (!firstName && !lastName) {
-    // Try Deal_Name then Contact_Name (which arrives as { name: ..., id: ... }).
-    const dealName = pickString(record, ['Deal_Name']);
-    const contactName = pickContactName(record);
-    const full = dealName || contactName;
-    if (full) {
-      const parts = full.trim().split(/\s+/);
-      firstName = parts[0] || null;
-      lastName = parts.slice(1).join(' ') || null;
-    }
-  }
-
-  return {
-    id: recordId,
-    firstName,
-    lastName,
-    email,
-  };
+  return { id: recordId, firstName, lastName, email, relationship, dealId };
 }
 
-function pickString(record: ZohoRecord, keys: string[]): string | null {
-  for (const k of keys) {
-    const v = record[k];
-    if (typeof v === 'string' && v.trim().length > 0) return v.trim();
-  }
-  return null;
-}
-
-function pickContactName(record: ZohoRecord): string | null {
-  const v = record['Contact_Name'];
-  if (v && typeof v === 'object' && 'name' in v) {
-    const name = (v as { name?: unknown }).name;
-    if (typeof name === 'string' && name.trim().length > 0) return name.trim();
-  }
-  return null;
-}
-
-/** Write the assessment results back to a Zoho record. */
+/**
+ * Write the five True Colors fields to any module (Contacts_Hub or Deals).
+ * `True_Colors_Rcvd` is a Zoho Date field, so we send YYYY-MM-DD.
+ */
 export async function writeResults(
-  module: ZohoModule,
+  module: string,
   recordId: string,
   scores: Scores,
-  primary: Color,
-  completedAtIso: string,
 ): Promise<void> {
   const token = await getAccessToken();
+  const today = todayYmd();
   const payload = {
     data: [
       {
@@ -154,12 +128,11 @@ export async function writeResults(
         [ZOHO_FIELDS.blue]: scores.blue,
         [ZOHO_FIELDS.gold]: scores.gold,
         [ZOHO_FIELDS.green]: scores.green,
-        [ZOHO_FIELDS.primary]: primary.charAt(0).toUpperCase() + primary.slice(1),
-        [ZOHO_FIELDS.completedAt]: completedAtIso,
+        [ZOHO_FIELDS.received]: today,
       },
     ],
   };
-  const res = await fetch(`${apiBase()}/crm/v6/${module}`, {
+  const res = await fetch(`${apiBase()}/crm/v6/${encodeURIComponent(module)}`, {
     method: 'PUT',
     headers: {
       Authorization: `Zoho-oauthtoken ${token}`,
@@ -170,17 +143,44 @@ export async function writeResults(
   });
   const text = await res.text();
   if (!res.ok) {
-    throw new Error(`Zoho write failed (${res.status}): ${text}`);
+    throw new Error(`Zoho write to ${module} failed (${res.status}): ${text}`);
   }
-  // Zoho returns 200 even when individual rows fail; check per-record status.
   try {
-    const body = JSON.parse(text) as { data?: Array<{ code?: string; message?: string; status?: string }> };
+    const body = JSON.parse(text) as {
+      data?: Array<{ code?: string; message?: string; status?: string }>;
+    };
     const row = body.data?.[0];
     if (row && row.status && row.status !== 'success') {
-      throw new Error(`Zoho per-record error: ${row.code || ''} ${row.message || ''}`.trim());
+      throw new Error(
+        `Zoho ${module} per-record error: ${row.code || ''} ${row.message || ''}`.trim(),
+      );
     }
   } catch (err) {
-    if (err instanceof Error && err.message.startsWith('Zoho per-record')) throw err;
-    // JSON parse fall-through is harmless when status is 2xx.
+    if (err instanceof Error && err.message.startsWith('Zoho ')) throw err;
   }
+}
+
+function pickString(record: ZohoRecord, keys: string[]): string | null {
+  for (const k of keys) {
+    const v = record[k];
+    if (typeof v === 'string' && v.trim().length > 0) return v.trim();
+  }
+  return null;
+}
+
+function pickLookupId(record: ZohoRecord, key: string): string | null {
+  const v = record[key];
+  if (v && typeof v === 'object' && 'id' in v) {
+    const id = (v as { id?: unknown }).id;
+    if (typeof id === 'string' && id.trim().length > 0) return id.trim();
+  }
+  return null;
+}
+
+function todayYmd(): string {
+  const d = new Date();
+  const yyyy = d.getUTCFullYear();
+  const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+  const dd = String(d.getUTCDate()).padStart(2, '0');
+  return `${yyyy}-${mm}-${dd}`;
 }

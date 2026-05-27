@@ -15,14 +15,13 @@ export type Responses = Array<Array<number | null>>;
 
 export type CandidateRow = {
   token: string;
-  zoho_module: 'Leads' | 'Contacts' | 'Deals';
+  zoho_module: string;
   zoho_record_id: string;
   first_name: string | null;
   last_name: string | null;
   email: string | null;
   responses: Responses;
   scores: Scores | null;
-  primary_color: Color | null;
   is_complete: boolean;
   started_at: string | null;
   completed_at: string | null;

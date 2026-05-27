@@ -1,7 +1,13 @@
 import { NextResponse } from 'next/server';
 import { getSupabase } from '@/lib/supabase';
 import { calculateScores, isComplete, isValidShape, primaryColor } from '@/lib/scoring';
-import { writeResults, type ZohoModule } from '@/lib/zoho';
+import {
+  CONTACTS_HUB_MODULE,
+  DEAL_MODULE,
+  OPPORTUNITY_OWNER,
+  fetchContactsHub,
+  writeResults,
+} from '@/lib/zoho';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -33,7 +39,7 @@ export async function POST(
 
   const { data: row, error: lookupErr } = await supabase
     .from('assessment_progress')
-    .select('token, zoho_module, zoho_record_id, is_complete')
+    .select('token, zoho_record_id, is_complete')
     .eq('token', token)
     .maybeSingle();
 
@@ -48,14 +54,28 @@ export async function POST(
   const primary = primaryColor(scores);
   const completedAt = new Date().toISOString();
 
-  // Idempotent re-submit: if already complete, just return the scores.
+  // Idempotent re-submit: if already complete, just hand back the scores.
   if (row.is_complete) {
     return NextResponse.json({ ok: true, scores, primary });
   }
 
-  // Zoho first — if it fails, we keep the row open so the user can retry.
+  // Re-fetch the Contacts_Hub record so Relationship + Deal are current,
+  // not whatever they were when the token was minted.
+  let candidate;
   try {
-    await writeResults(row.zoho_module as ZohoModule, row.zoho_record_id, scores, primary, completedAt);
+    candidate = await fetchContactsHub(row.zoho_record_id);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    await supabase
+      .from('assessment_progress')
+      .update({ zoho_sync_error: message, responses })
+      .eq('token', token);
+    return NextResponse.json({ error: `Zoho lookup failed: ${message}` }, { status: 502 });
+  }
+
+  // Write to Contacts_Hub first (the candidate's own record).
+  try {
+    await writeResults(CONTACTS_HUB_MODULE, row.zoho_record_id, scores);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     await supabase
@@ -65,12 +85,36 @@ export async function POST(
     return NextResponse.json({ error: `Zoho sync failed: ${message}` }, { status: 502 });
   }
 
+  // Conditional dual-write: mirror scores to the linked Deal if this candidate
+  // is the Opportunity Owner and the Deal lookup is populated.
+  const shouldWriteDeal =
+    candidate.relationship === OPPORTUNITY_OWNER &&
+    typeof candidate.dealId === 'string' &&
+    candidate.dealId.length > 0;
+
+  if (shouldWriteDeal && candidate.dealId) {
+    try {
+      await writeResults(DEAL_MODULE, candidate.dealId, scores);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      // Contacts_Hub already accepted; record the failure and bail so the
+      // candidate can retry. A retry will re-write Contacts_Hub harmlessly.
+      await supabase
+        .from('assessment_progress')
+        .update({ zoho_sync_error: `Deal write failed: ${message}`, responses })
+        .eq('token', token);
+      return NextResponse.json(
+        { error: `Deal sync failed: ${message}` },
+        { status: 502 },
+      );
+    }
+  }
+
   const { error: updateErr } = await supabase
     .from('assessment_progress')
     .update({
       responses,
       scores,
-      primary_color: primary,
       is_complete: true,
       completed_at: completedAt,
       zoho_synced_at: completedAt,
