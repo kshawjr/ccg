@@ -93,10 +93,20 @@ export default function Assessment(props: Props) {
   const [tip, setTip] = useState<{ word: string; def: string; x: number; y: number; visible: boolean } | null>(null);
 
   // Submit/sync
-  const [syncStatus, setSyncStatus] = useState<'idle' | 'syncing' | 'done' | 'error'>(
+  const [syncStatus, setSyncStatus] = useState<'idle' | 'syncing' | 'done' | 'error' | 'blocked'>(
     alreadyComplete ? 'done' : 'idle',
   );
   const [syncError, setSyncError] = useState<string | null>(null);
+
+  // Save health: 'unknown' until first save attempt resolves.
+  const [saveHealth, setSaveHealth] = useState<'unknown' | 'ok' | 'failed'>('unknown');
+  const saveHealthRef = useRef<'unknown' | 'ok' | 'failed'>('unknown');
+  const saveGenCounter = useRef(0);
+  const latestSaveGen = useRef(0);
+  const updateSaveHealth = useCallback((v: 'unknown' | 'ok' | 'failed') => {
+    saveHealthRef.current = v;
+    setSaveHealth(v);
+  }, []);
 
   // Final result scores
   const finalScores: Scores = useMemo(() => {
@@ -108,6 +118,44 @@ export default function Assessment(props: Props) {
     if (alreadyComplete && savedPrimary) return savedPrimary;
     return primaryColor(finalScores);
   }, [alreadyComplete, savedPrimary, finalScores]);
+
+  // ----- Save (single attempt + one retry after 2s) -----
+  // Uses a generation counter so a late-arriving stale save can't overwrite
+  // health that a newer save has already set.
+  const performSave = useCallback(
+    async (data: Responses): Promise<boolean> => {
+      const gen = ++saveGenCounter.current;
+      latestSaveGen.current = gen;
+
+      const attempt = async (): Promise<boolean> => {
+        try {
+          const res = await fetch(`/api/save/${encodeURIComponent(token)}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ responses: data }),
+            keepalive: true,
+          });
+          return res.ok;
+        } catch {
+          return false;
+        }
+      };
+
+      const ok = await attempt();
+      if (ok) {
+        if (gen === latestSaveGen.current) updateSaveHealth('ok');
+        return true;
+      }
+      if (gen !== latestSaveGen.current) return false; // superseded — skip retry
+      await new Promise((r) => setTimeout(r, 2000));
+      if (gen !== latestSaveGen.current) return false;
+      const okRetry = await attempt();
+      if (gen !== latestSaveGen.current) return okRetry;
+      updateSaveHealth(okRetry ? 'ok' : 'failed');
+      return okRetry;
+    },
+    [token, updateSaveHealth],
+  );
 
   // ----- Autosave (debounced) -----
   const saveTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -122,19 +170,12 @@ export default function Assessment(props: Props) {
     }
     if (saveTimer.current) clearTimeout(saveTimer.current);
     saveTimer.current = setTimeout(() => {
-      fetch(`/api/save/${encodeURIComponent(token)}`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ responses }),
-        keepalive: true,
-      }).catch(() => {
-        /* server is best-effort; LS holds the fallback */
-      });
+      void performSave(responses);
     }, AUTOSAVE_DEBOUNCE_MS);
     return () => {
       if (saveTimer.current) clearTimeout(saveTimer.current);
     };
-  }, [responses, token, alreadyComplete]);
+  }, [responses, token, alreadyComplete, performSave]);
 
   // ----- Long-press handlers -----
   const pressTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -267,8 +308,15 @@ export default function Assessment(props: Props) {
   }, [reducedMotion]);
 
   // After row 6 completes, kick off submit then show results.
+  // Guards on save health: if the latest save failed, don't submit — surface
+  // a 'blocked' state so the user can retry the save first.
   const triggerSubmit = useCallback(
     async (finalResponses: Responses) => {
+      if (saveHealthRef.current === 'failed') {
+        setSyncStatus('blocked');
+        setSyncError(null);
+        return;
+      }
       setSyncStatus('syncing');
       setSyncError(null);
       try {
@@ -385,6 +433,19 @@ export default function Assessment(props: Props) {
     void triggerSubmit(responses);
   }, [triggerSubmit, responses]);
 
+  // Retry path used from the 'blocked' state: re-fire the save; if it now
+  // succeeds, chain into the submit.
+  const onRetryFromBlocked = useCallback(async () => {
+    setSyncStatus('syncing');
+    setSyncError(null);
+    const ok = await performSave(responses);
+    if (ok) {
+      await triggerSubmit(responses);
+    } else {
+      setSyncStatus('blocked');
+    }
+  }, [performSave, responses, triggerSubmit]);
+
   // Number of ranks placed in current row, for the instruction text.
   const ranksPlaced = responses[currentRound].filter((v) => v !== null).length;
   const rowDone = ranksPlaced === 4;
@@ -418,6 +479,11 @@ export default function Assessment(props: Props) {
       {phase === 'quiz' && (
         <main className="app">
           <div className="app-inner">
+            {saveHealth === 'failed' && (
+              <div className="save-warning" role="status" aria-live="polite">
+                Progress not saving — check your connection.
+              </div>
+            )}
             <p className="greeting">
               Hi <strong>{firstName}</strong> — let&rsquo;s find your colors
             </p>
@@ -532,6 +598,7 @@ export default function Assessment(props: Props) {
           syncStatus={syncStatus}
           syncError={syncError}
           onRetry={onRetrySubmit}
+          onRetryFromBlocked={onRetryFromBlocked}
           reducedMotion={reducedMotion}
         />
       )}
@@ -627,14 +694,16 @@ function Results({
   syncStatus,
   syncError,
   onRetry,
+  onRetryFromBlocked,
   reducedMotion,
 }: {
   firstName: string;
   scores: Scores;
   primary: Color;
-  syncStatus: 'idle' | 'syncing' | 'done' | 'error';
+  syncStatus: 'idle' | 'syncing' | 'done' | 'error' | 'blocked';
   syncError: string | null;
   onRetry: () => void;
+  onRetryFromBlocked: () => void;
   reducedMotion: boolean;
 }) {
   const ordered = (['orange', 'blue', 'gold', 'green'] as Color[]).sort(
@@ -720,12 +789,24 @@ function Results({
           {syncStatus === 'error' && (
             <span style={{ color: '#7a2e10' }}>Couldn&rsquo;t reach the server.</span>
           )}
+          {syncStatus === 'blocked' && (
+            <span style={{ color: '#7a2e10' }}>Couldn&rsquo;t reach the server.</span>
+          )}
         </div>
 
         {syncStatus === 'error' && (
           <div className="error">
             <span>{syncError || 'Submission failed. You can try again.'}</span>
             <button type="button" className="btn primary" onClick={onRetry}>
+              Try again
+            </button>
+          </div>
+        )}
+
+        {syncStatus === 'blocked' && (
+          <div className="error">
+            <span>We can&rsquo;t reach the server. Please check your connection and try again.</span>
+            <button type="button" className="btn primary" onClick={onRetryFromBlocked}>
               Try again
             </button>
           </div>
